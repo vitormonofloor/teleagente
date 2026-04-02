@@ -291,7 +291,7 @@ app.post('/webhook',async(req,res)=>{
       case'/aproveitamento': resposta=await cmdAproveitamento();break;
       case'/alerta': resposta=await cmdAlerta();break;
       case'/status': resposta=await cmdStatus(arg);break;
-      case'/semana': resposta=await cmdSemana();break;
+      case'/semana': resposta=await cmdSemana();break;    case'/meuid': resposta='🆔 Chat ID: '+chatId+' | User: '+from.id;break;
       default:
         if(!text.startsWith('/')){
           if(!ANTHROPIC_KEY||ANTHROPIC_KEY.includes('SUBSTITUIR')){
@@ -315,4 +315,4 @@ app.listen(PORT,()=>{
   if(!BOT_TOKEN)console.warn('⚠️ TELEGRAM_BOT_TOKEN não configurado');
   if(!PIPEFY_TOKEN)console.warn('⚠️ PIPEFY_TOKEN não configurado');
   if(!ANTHROPIC_KEY||ANTHROPIC_KEY.includes('SUBSTITUIR'))console.warn('⚠️ ANTHROPIC_API_KEY não configurado');
-});
+});h
