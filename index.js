@@ -1,318 +1,859 @@
-// ═══════════════════════════════════════════════════════════════
-//  TELEAGENTE — Monofloor · Agente Operacional no Telegram
-//  Versão B — Linguagem Natural + Dados ao Vivo
-// ═══════════════════════════════════════════════════════════════
+const express = require('express');
+const fetch = require('node-fetch');
 
-import express from 'express';
-import fetch from 'node-fetch';
 const app = express();
 app.use(express.json());
 
-const BOT_TOKEN    = process.env.TELEGRAM_BOT_TOKEN;
+// ── ENV ────────────────────────────────────────────────────────────
+const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const PIPEFY_TOKEN = process.env.PIPEFY_TOKEN;
-const ANTHROPIC_KEY= process.env.ANTHROPIC_API_KEY;
-const PLAN_API     = process.env.PLAN_API_URL || 'https://planejamento.monofloor.cloud/api';
-const PORT         = process.env.PORT || 3000;
-const PIPE_OE='306410007', PIPE_OEC='306446640', FASE_EXEC='338741343', FASE_PAUSA='338994841';
+const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
+const PLAN_URL = process.env.PLAN_API_URL || 'https://planejamento.monofloor.cloud/api';
+const TG_API = `https://api.telegram.org/bot${TG_TOKEN}`;
 
-async function gql(query) {
-  const r = await fetch('https://api.pipefy.com/graphql', {
-    method:'POST', headers:{'Content-Type':'application/json','Authorization':'Bearer '+PIPEFY_TOKEN},
-    body:JSON.stringify({query})
-  });
-  const d=await r.json();
-  if(d.errors&&!d.data) throw new Error(d.errors[0]?.message);
-  return d.data;
+const VITOR_CHAT_ID = process.env.VITOR_CHAT_ID; // Vitor's private chat for briefings
+const PIPE_OE = 306410007;
+const PIPE_OEC = 306446640;
+const FASE_EXEC = 338741343;
+
+// ── ACTIVE MODE — TRACKED GROUPS ───────────────────────────────────
+// Groups are auto-registered when bot receives a message from them
+const trackedGroups = {}; // { chatId: { name, lastActivity, lastMessage, registered } }
+
+// ── KEYWORD DETECTION SYSTEM ───────────────────────────────────────
+
+const KEYWORDS = {
+  finalizado: {
+    label: '✅ Obra Finalizada',
+    gravidade: 'marco',
+    palavras: [
+      'finalizado', 'finalizamos', 'terminamos', 'obra concluída',
+      'obra concluida', 'entregue', 'aprovado pelo cliente',
+      'vistoria aprovada', 'tudo pronto', 'obra pronta',
+      'concluído', 'concluido', 'finalizada', 'entrega realizada',
+      'cliente aprovou', 'vistoria ok', 'aprovação ok',
+    ],
+    minMatch: 1,
+    resposta: '✅ *Obra Finalizada detectada!*\nRegistrado automaticamente na timeline.',
+  },
+  pausa: {
+    label: '⏸️ Obra Pausada',
+    gravidade: 'alta',
+    palavras: [
+      'obra pausada', 'pausamos', 'paramos', 'parou a obra',
+      'aguardando definição', 'sem previsão de retomada',
+      'cliente pediu pausa', 'obra parada', 'interrompemos',
+    ],
+    minMatch: 1,
+    resposta: '⏸️ *Pausa detectada!*\nRegistrado na timeline. Motivo será solicitado.',
+  },
+  sem_aplicador: {
+    label: '🚫 Sem Aplicador',
+    gravidade: 'alta',
+    palavras: [
+      'sem aplicador', 'não compareceu', 'nao compareceu',
+      'não veio', 'nao veio', 'faltou', 'não foi', 'nao foi',
+      'só um aplicador', 'so um aplicador', 'sozinho na obra',
+      'sem equipe', 'não conseguiu ir', 'nao conseguiu ir',
+      'problemas pessoais', 'aplicador faltou',
+    ],
+    minMatch: 1,
+    resposta: '🚫 *Ausência de aplicador detectada!*\nDia registrado como perda operacional.',
+  },
+  qualidade: {
+    label: '⚠️ Problema de Qualidade',
+    gravidade: 'alta',
+    palavras: [
+      'desplacamento', 'desplacou', 'manchou', 'mancha',
+      'bolha', 'trinca', 'trincou', 'irregular', 'defeito',
+      'mal executado', 'retocar', 'retoque', 'reaplicar',
+      'tela aparente', 'telas aparentes', 'falha', 'rachadura',
+      'amassado', 'amassamento', 'infiltração', 'infiltrou',
+      'espelhamento', 'rejunte aparente', 'soltou', 'descascou',
+    ],
+    minMatch: 1,
+    resposta: '⚠️ *Problema de qualidade detectado!*\nRegistrado para análise.',
+  },
+  comunicacao: {
+    label: '💬 Falha de Comunicação',
+    gravidade: 'media',
+    palavras: [
+      'alinhou direto', 'combinou com o cliente', 'sem comunicar',
+      'sem passar pela operação', 'não informou', 'nao informou',
+      'sem devolutiva', 'sem resposta', 'não respondeu',
+      'cliente pediu direto', 'repassou prazo direto',
+      'sem registro no grupo',
+    ],
+    minMatch: 1,
+    resposta: '💬 *Falha de comunicação detectada!*\nRegistrado como ocorrência de processo.',
+  },
+  cliente: {
+    label: '👤 Impedimento do Cliente',
+    gravidade: 'media',
+    palavras: [
+      'cliente não pôde', 'cliente nao pode', 'sem acesso',
+      'obra fechada', 'remarcação', 'remarcar',
+      'portaria não liberou', 'portaria nao liberou',
+      'cliente viajou', 'indisponível', 'indisponivel',
+      'mudou o escopo', 'aguardando aprovação do cliente',
+    ],
+    minMatch: 1,
+    resposta: '👤 *Impedimento do cliente detectado!*\nRegistrado como causa externa.',
+  },
+  clima: {
+    label: '🌧️ Clima / Ambiente',
+    gravidade: 'media',
+    palavras: [
+      'chuva', 'chovendo', 'umidade alta', 'vazamento',
+      'goteira', 'alagou', 'molhado', 'não secou', 'nao secou',
+      'demora pra secar', 'umidade atrasando',
+    ],
+    minMatch: 1,
+    resposta: '🌧️ *Condição climática detectada!*\nRegistrado como causa externa.',
+  },
+  material_extra: {
+    label: '📦 Material Extra',
+    gravidade: 'media',
+    palavras: [
+      'material extra', 'faltou material', 'acabou o material',
+      'solicitar material', 'pedir material', 'produção extra',
+      'material adicional', 'faltou massa', 'faltou verniz',
+      'faltou primer', 'faltou selador',
+    ],
+    minMatch: 1,
+    resposta: '📦 *Solicitação de material extra detectada!*\nRegistrado na timeline.',
+  },
+  diario: {
+    label: '📸 Diário de Obra',
+    gravidade: 'info',
+    palavras: [
+      'aplicamos hoje', 'executamos', 'primeira demão',
+      'segunda demão', 'terceira demão', 'lixamento concluído',
+      'selador aplicado', 'verniz aplicado', 'primer aplicado',
+      'massa aplicada', 'diário de obra', 'diario de obra',
+    ],
+    minMatch: 1,
+    resposta: null, // Diário não precisa de confirmação
+  },
+};
+
+// ── STORAGE (in-memory — persists while Railway is up) ─────────────
+
+const ocorrencias = {}; // { chatId: [{ tipo, msg, autor, data, keywords }] }
+const obraStatus = {};  // { chatId: { statusReal, ultimoSinal, data } }
+const diasRegistro = {}; // { chatId: { [date]: true } } — para detectar dias cegos
+
+// ── DETECTION ENGINE ───────────────────────────────────────────────
+
+function detectKeywords(text) {
+  if (!text) return [];
+  const lower = text.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+  const textNorm = text.toLowerCase();
+  const matches = [];
+
+  for (const [tipo, config] of Object.entries(KEYWORDS)) {
+    const found = config.palavras.filter(kw => {
+      const kwNorm = kw.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+      return lower.includes(kwNorm) || textNorm.includes(kw);
+    });
+
+    if (found.length >= config.minMatch) {
+      matches.push({ tipo, label: config.label, gravidade: config.gravidade, keywords: found, resposta: config.resposta });
+    }
+  }
+
+  // Priorizar: finalizado > pausa > sem_aplicador > qualidade > outros > diario
+  const prioOrder = ['finalizado', 'pausa', 'sem_aplicador', 'qualidade', 'comunicacao', 'cliente', 'clima', 'material_extra', 'diario'];
+  matches.sort((a, b) => prioOrder.indexOf(a.tipo) - prioOrder.indexOf(b.tipo));
+
+  return matches;
 }
 
-async function planApi(path) {
-  try { const r=await fetch(PLAN_API+path,{headers:{'Accept':'application/json'}}); return r.ok?await r.json():null; }
-  catch { return null; }
-}
-
-function send(chatId,text) {
-  return fetch('https://api.telegram.org/bot'+BOT_TOKEN+'/sendMessage',{
-    method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({chat_id:chatId,text,parse_mode:'Markdown'})
-  });
-}
-function esc(t){return String(t||'—').replace(/[_*[\]()~`>#+=|{}.!-]/g,'\\$&');}
-function hj(){return new Date();}
-function diasAtraso(s){if(!s)return null;return Math.floor((hj()-new Date(s))/86400000);}
-
-async function buscarObrasPausadas() {
-  const [pip,plan]=await Promise.all([
-    gql('{phase(id:"'+FASE_PAUSA+'"){cards(first:50){edges{node{id title fields{name value}}}}}}').catch(()=>null),
-    planApi('/projects?limit=500').catch(()=>null)
-  ]);
-  const gf=(fields,name)=>fields?.find(f=>f.name?.toLowerCase().includes(name.toLowerCase()))?.value||null;
-  const pipPaus=(pip?.phase?.cards?.edges||[]).map(e=>({
-    nome:e.node.title.replace(/\(.*?\)/g,'').trim(),
-    m2:gf(e.node.fields,'M²')||gf(e.node.fields,'metragem')||'?',
-    consultor:gf(e.node.fields,'CONSULTOR')||'?',
-    motivo:gf(e.node.fields,'motivo'),fonte:'Pipefy'
-  }));
-  const planPaus=(plan||[]).filter(p=>p.status==='pausado'||p.status==='pausada'||p.pipefyFase?.toLowerCase().includes('paus')).map(p=>({
-    nome:p.cliente?.nome||'—',m2:p.projeto?.metragem||'?',
-    consultor:p.consultor||p.responsavel||'?',cidade:p.projeto?.cidade||null,
-    motivo:p.motivoPausa||null,diasPausada:p.dataPausa?diasAtraso(p.dataPausa):null,fonte:'Banco'
-  }));
-  const todas=[...planPaus];
-  pipPaus.forEach(pp=>{if(!todas.some(p=>p.nome.toLowerCase().includes(pp.nome.toLowerCase().substring(0,10))))todas.push(pp);});
-  return todas;
-}
-
-async function buscarObrasEmExecucao() {
-  const data=await gql('{phase(id:"'+FASE_EXEC+'"){cards(first:50){edges{node{id title fields{name value}}}}}}');
-  const gf=(fields,name)=>fields?.find(f=>f.name?.toLowerCase().includes(name.toLowerCase()))?.value||'—';
-  return (data?.phase?.cards?.edges||[]).map(e=>({
-    nome:e.node.title.replace(/\(.*?\)/g,'').trim(),
-    m2:gf(e.node.fields,'M²'),consultor:gf(e.node.fields,'CONSULTOR OPERACIONAL')
-  }));
-}
-
-async function buscarGargalos() {
-  const data=await gql('{oec:pipe(id:"'+PIPE_OEC+'"){phases{id name cards_count}} oe:pipe(id:"'+PIPE_OE+'"){phases{id name cards_count}}}');
-  const fp=(phases,kw)=>phases?.find(p=>p.name.toLowerCase().includes(kw.toLowerCase()));
-  return {g1:fp(data?.oec?.phases,'solicitar'),g2:fp(data?.oe?.phases,'agend. vt'),g3:fp(data?.oe?.phases,'aguardando libera'),g4:fp(data?.oe?.phases,'pausada')};
-}
-
-async function buscarObrasAtrasadas() {
-  const projects=await planApi('/projects?limit=500');
-  if(!projects)return[];
-  return projects.filter(p=>{const dp=p.estimativaPrazo?.dataPrevista;return dp&&new Date(dp)<hj()&&['em_execucao','aguardando_execucao'].includes(p.status);})
-    .map(p=>({nome:p.cliente?.nome||'—',m2:p.projeto?.metragem||0,diasAtraso:Math.floor((hj()-new Date(p.estimativaPrazo.dataPrevista))/86400000),consultor:p.consultor||p.responsavel||'?',cidade:p.projeto?.cidade||null}))
-    .sort((a,b)=>b.diasAtraso-a.diasAtraso);
-}
-
-async function processarMensagemNatural(texto) {
-  const t=texto.toLowerCase();
-  const intencoes={
-    pausadas:/paus(ada|ado|adas|ados)|parou|parada|paralisa/i.test(texto),
-    execucao:/execu(cao|ção|tando)|andamento|campo|rodando/i.test(texto),
-    atrasadas:/atrasa(da|do|das|dos)|prazo|pendente/i.test(texto),
-    gargalos:/gargal|trava(do|da)|acumul/i.test(texto),
-    alerta:/alerta|urgente|critico|crítico|atenção|atencao/i.test(texto),
-    semana:/semana|resumo|balanço|overview/i.test(texto),
+function registrarOcorrencia(chatId, tipo, mensagem, autor, keywords) {
+  if (!ocorrencias[chatId]) ocorrencias[chatId] = [];
+  const registro = {
+    tipo,
+    mensagem: mensagem.substring(0, 200),
+    autor,
+    data: new Date().toISOString(),
+    keywords,
   };
-  const dadosColetados={};
-  const promessas=[];
-  if(intencoes.pausadas) promessas.push(buscarObrasPausadas().then(d=>{dadosColetados.pausadas=d;}));
-  if(intencoes.execucao||intencoes.semana) promessas.push(buscarObrasEmExecucao().then(d=>{dadosColetados.emExecucao=d;}));
-  if(intencoes.atrasadas||intencoes.semana||intencoes.alerta) promessas.push(buscarObrasAtrasadas().then(d=>{dadosColetados.atrasadas=d;}));
-  if(intencoes.gargalos||intencoes.semana||intencoes.alerta) promessas.push(buscarGargalos().then(d=>{dadosColetados.gargalos=d;}));
-  if(!Object.values(intencoes).some(Boolean)){
-    promessas.push(buscarGargalos().then(d=>{dadosColetados.gargalos=d;}));
-    promessas.push(buscarObrasEmExecucao().then(d=>{dadosColetados.emExecucao=d;}));
+  ocorrencias[chatId].push(registro);
+
+  // Atualizar status real da obra se for sinal forte
+  if (['finalizado', 'pausa'].includes(tipo)) {
+    obraStatus[chatId] = {
+      statusReal: tipo,
+      ultimoSinal: registro,
+      data: registro.data,
+    };
   }
-  await Promise.all(promessas.map(p=>p.catch(e=>console.error('Erro coleta:',e.message))));
-  let ctx='Data atual: '+new Date().toLocaleDateString('pt-BR')+'\n\n';
-  if(dadosColetados.pausadas!==undefined){
-    if(!dadosColetados.pausadas.length) ctx+='OBRAS PAUSADAS: Nenhuma obra pausada no momento.\n\n';
-    else {
-      ctx+='OBRAS PAUSADAS ('+dadosColetados.pausadas.length+' obras):\n';
-      dadosColetados.pausadas.forEach((o,i)=>{
-        ctx+=(i+1)+'. '+o.nome;
-        if(o.m2&&o.m2!=='?') ctx+=' | '+o.m2+'m²';
-        if(o.consultor&&o.consultor!=='?') ctx+=' | Consultor: '+o.consultor;
-        if(o.cidade) ctx+=' | '+o.cidade;
-        if(o.motivo) ctx+=' | Motivo: '+o.motivo;
-        if(o.diasPausada) ctx+=' | '+o.diasPausada+'d pausada';
-        ctx+='\n';
-      });
-      ctx+='\n';
-    }
-  }
-  if(dadosColetados.emExecucao!==undefined){
-    ctx+='OBRAS EM EXECUÇÃO ('+dadosColetados.emExecucao.length+'):\n';
-    dadosColetados.emExecucao.forEach((o,i)=>{ctx+=(i+1)+'. '+o.nome+' | '+o.m2+'m² | '+o.consultor+'\n';});
-    ctx+='\n';
-  }
-  if(dadosColetados.atrasadas!==undefined){
-    ctx+='OBRAS ATRASADAS ('+dadosColetados.atrasadas.length+' total):\n';
-    dadosColetados.atrasadas.slice(0,10).forEach((o,i)=>{ctx+=(i+1)+'. '+o.nome+' | '+o.m2+'m² | '+o.diasAtraso+'d de atraso | '+o.consultor+'\n';});
-    ctx+='\n';
-  }
-  if(dadosColetados.gargalos!==undefined){
-    const g=dadosColetados.gargalos;
-    ctx+='GARGALOS PIPEFY:\n';
-    if(g.g1) ctx+='G1 (Solicitar Coleta OEC): '+g.g1.cards_count+' cards\n';
-    if(g.g2) ctx+='G2 (Agend. VT Aferição): '+g.g2.cards_count+' cards\n';
-    if(g.g3) ctx+='G3 (Aguardando Liberação): '+g.g3.cards_count+' cards\n';
-    if(g.g4) ctx+='G4 (Obra Pausada): '+g.g4.cards_count+' cards\n';
-    ctx+='\n';
-  }
-  return ctx;
+
+  // Marcar dia com registro (para detecção de dia cego)
+  const hoje = new Date().toISOString().split('T')[0];
+  if (!diasRegistro[chatId]) diasRegistro[chatId] = {};
+  diasRegistro[chatId][hoje] = true;
+
+  return registro;
 }
 
-async function claudeAI(mensagemUsuario, contextoOperacional) {
-  const r=await fetch('https://api.anthropic.com/v1/messages',{
-    method:'POST',
-    headers:{'Content-Type':'application/json','x-api-key':ANTHROPIC_KEY,'anthropic-version':'2023-06-01'},
-    body:JSON.stringify({
-      model:'claude-sonnet-4-20250514',max_tokens:1000,
-      system:'Você é o Teleagente da Monofloor. Assistente operacional de Vitor Gomes (Gerente de Qualidade).\n\nREGRAS IMPORTANTES:\n- Você recebe DADOS REAIS e AO VIVO no contexto\n- Responda com base EXATAMENTE nos dados fornecidos\n- Se dados mostram 0 obras pausadas, diga isso claramente\n- Se há obras pausadas, liste TODAS com detalhes\n- Use emojis para facilitar leitura no Telegram\n- Seja direto e analítico\n- Máximo 400 palavras\n- Responda em português',
-      messages:[{role:'user',content:'DADOS AO VIVO DA OPERAÇÃO (buscados agora em tempo real):\n'+contextoOperacional+'\n\nPERGUNTA DO VITOR: '+mensagemUsuario}]
-    })
+// ── TELEGRAM HELPERS ───────────────────────────────────────────────
+
+async function sendMsg(chatId, text, opts = {}) {
+  await fetch(`${TG_API}/sendMessage`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'Markdown', ...opts }),
   });
-  const d=await r.json();
-  return d.content?.[0]?.text||'Erro ao consultar IA.';
 }
 
-function cmdAjuda(){
-  return '🏗 *Teleagente Monofloor* · Versão Inteligente\n\nPode me perguntar em linguagem natural:\n• "Quais obras estão pausadas?"\n• "Me mostra as obras atrasadas"\n• "O que precisa de atenção hoje?"\n\nOu use os atalhos:\n📊 */obras* — em execução agora\n⏸ */pausadas* — obras pausadas\n⌟ */atrasadas* — maiores atrasos\n🔴 */gargalos* — G1–G4 Pipefy\n📐 */aproveitamento* — prazos vs realizado\n⚠️ */alerta* — atenção hoje\n🔍 */status [nome]* — detalhe da obra\n📋 */semana* — resumo semanal\n❓ */ajuda* — esta mensagem';
+// ── PIPEFY HELPERS ─────────────────────────────────────────────────
+
+async function pipefyQuery(query) {
+  const r = await fetch('https://api.pipefy.com/graphql', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${PIPEFY_TOKEN}` },
+    body: JSON.stringify({ query }),
+  });
+  return r.json();
 }
 
-async function cmdObras(){
+async function getObrasExecucao() {
+  const d = await pipefyQuery(`{ phase(id: ${FASE_EXEC}) { cards(first: 30) { edges { node { title due_date current_phase_age fields { name value } } } } } }`);
+  return d.data.phase.cards.edges.map(e => {
+    const n = e.node;
+    const gf = (k) => { const f = n.fields.find(x => x.name.toLowerCase().startsWith(k)); return f ? f.value : null; };
+    return { title: n.title, due: n.due_date, age: Math.round(n.current_phase_age / 86400), prazo: gf('prazo'), tipo: gf('tipo') };
+  });
+}
+
+async function getGargalos() {
+  const [oe, oec] = await Promise.all([
+    pipefyQuery(`{ pipe(id: ${PIPE_OE}) { phases { name cards_count } } }`),
+    pipefyQuery(`{ pipe(id: ${PIPE_OEC}) { phases { name cards_count } } }`),
+  ]);
+  const fases = oe.data.pipe.phases.filter(p => p.cards_count > 15).map(p => `• *${p.name}*: ${p.cards_count} cards`);
+  const oecFases = oec.data.pipe.phases.filter(p => p.cards_count > 10).map(p => `• *${p.name}*: ${p.cards_count} cards`);
+  return { oe: fases, oec: oecFases };
+}
+
+// ── PLAN API HELPERS ───────────────────────────────────────────────
+
+async function getAtrasadas() {
   try {
-    const obras=await buscarObrasEmExecucao();
-    if(!obras.length)return '🏠 Nenhuma obra em execução no Pipefy agora.';
-    let msg='🏗 *Obras em Execução* ('+obras.length+')\n\n';
-    obras.slice(0,15).forEach((o,i)=>{msg+=(i+1)+'\\.  *'+esc(o.nome.substring(0,35))+'*\n   📐 '+esc(o.m2)+'m² · 👤 '+esc(o.consultor)+'\n';});
-    return msg;
-  } catch(e){return '❌ Erro: '+e.message;}
+    const r = await fetch(`${PLAN_URL}/projects?limit=500`);
+    const d = await r.json();
+    const projects = d.projects || d || [];
+    return projects.filter(p => p.status === 'delayed' || p.delayed).slice(0, 15);
+  } catch { return []; }
 }
 
-async function cmdPausadas(){
+async function getAproveitamento() {
   try {
-    const obras=await buscarObrasPausadas();
-    if(!obras.length)return '✅ Nenhuma obra pausada no momento.';
-    let msg='⏸ *Obras Pausadas* ('+obras.length+')\n\n';
-    obras.forEach((o,i)=>{
-      msg+=(i+1)+'\\.  *'+esc(o.nome.substring(0,35))+'*\n';
-      if(o.m2&&o.m2!=='?')msg+='   📐 '+o.m2+'m²';
-      if(o.consultor&&o.consultor!=='?')msg+=' · 👤 '+esc(o.consultor);
-      if(o.cidade)msg+=' · 📍 '+esc(o.cidade);
-      msg+='\n';
-      if(o.motivo)msg+='   ⚠️ _'+esc(o.motivo)+'_\n';
-      if(o.diasPausada)msg+='   ⌟ '+o.diasPausada+' dias pausada\n';
+    const r = await fetch(`${PLAN_URL}/projects?limit=500`);
+    const d = await r.json();
+    const projects = d.projects || d || [];
+    const total = projects.length;
+    const onTime = projects.filter(p => !p.delayed && p.status !== 'delayed').length;
+    return { total, onTime, pct: total > 0 ? ((onTime / total) * 100).toFixed(1) : 0 };
+  } catch { return { total: 0, onTime: 0, pct: 0 }; }
+}
+
+// ── AI HELPER ──────────────────────────────────────────────────────
+
+async function ai(prompt) {
+  if (!ANTHROPIC_KEY) return 'Chave Anthropic não configurada. Configure ANTHROPIC_API_KEY no Railway.';
+  try {
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({ model: 'claude-sonnet-4-20250514', max_tokens: 1000, messages: [{ role: 'user', content: prompt }] }),
     });
-    return msg;
-  } catch(e){return '❌ Erro: '+e.message;}
+    const d = await r.json();
+    return d.content?.[0]?.text || 'Sem resposta da IA.';
+  } catch (e) { return `Erro IA: ${e.message}`; }
 }
 
-async function cmdGargalos(){
-  try {
-    const g=await buscarGargalos();
-    const total=[g.g1,g.g2,g.g3,g.g4].reduce((s,x)=>s+(x?.cards_count||0),0);
-    const fmt=(x,e,l)=>x?e+' *'+l+'*: '+x.cards_count+' cards\n':'';
-    return '🔴 *Gargalos Ativos* — '+total+' cards\n\n'+
-      fmt(g.g1,'🔴','G1 — Solicitar Coleta (OEC)')+
-      fmt(g.g2,'🔴','G2 — Agend. VT Aferição')+
-      fmt(g.g3,'⚠️','G3 — Aguardando Liberação')+
-      fmt(g.g4,'⚠️','G4 — Obra Pausada')+
-      '\n_'+new Date().toLocaleString('pt-BR',{timeZone:'America/Sao_Paulo'})+'_';
-  } catch(e){return '❌ Erro: '+e.message;}
-}
+// ── COMMAND HANDLERS ───────────────────────────────────────────────
 
-async function cmdAtrasadas(){
-  try {
-    const lista=await buscarObrasAtrasadas();
-    if(!lista.length)return '✅ Nenhuma obra atrasada!';
-    let msg='⌟ *Obras Atrasadas* ('+lista.length+')\n\n';
-    lista.slice(0,12).forEach(o=>{
-      const e=o.diasAtraso>90?'🔴':o.diasAtraso>30?'🟠':'🟡';
-      msg+=e+' *'+esc(o.nome.substring(0,32))+'*\n   📐 '+o.m2+'m² · ⌟ '+o.diasAtraso+'d · 👤 '+esc(o.consultor)+'\n';
+const commands = {
+  '/obras': async (chatId) => {
+    const obras = await getObrasExecucao();
+    if (!obras.length) return sendMsg(chatId, 'Nenhuma obra em execução.');
+    let msg = `🔨 *Obras em Execução* (${obras.length})\n\n`;
+    obras.forEach(o => {
+      const status = obraStatus[chatId]; // Check for telegram overrides
+      const dias = o.age;
+      const emoji = dias > (parseInt(o.prazo) || 30) ? '🔴' : dias > (parseInt(o.prazo) || 30) * 0.7 ? '🟡' : '🟢';
+      msg += `${emoji} *${o.title}*\n   ${dias}d na fase | Prazo: ${o.prazo || '—'}d | ${o.tipo || 'NOVA'}\n\n`;
     });
-    return msg;
-  } catch(e){return '❌ Erro: '+e.message;}
-}
+    return sendMsg(chatId, msg);
+  },
 
-async function cmdAproveitamento(){
-  try {
-    const projects=await planApi('/projects?limit=500');
-    if(!projects)return '❌ Banco indisponível.';
-    const emExec=projects.filter(p=>p.status==='em_execucao');
-    const atr=projects.filter(p=>{const dp=p.estimativaPrazo?.dataPrevista;return dp&&new Date(dp)<hj()&&p.status==='em_execucao';});
-    const pct=emExec.length?Math.round((emExec.length-atr.length)/emExec.length*100):0;
-    const prog=emExec.length?Math.round(emExec.reduce((s,p)=>s+(p.progress?.percentage||0),0)/emExec.length):0;
-    const m2=Math.round(emExec.reduce((s,p)=>s+(p.projeto?.metragem||0),0));
-    const e=pct>=80?'🟢':pct>=50?'🟡':'🔴';
-    return '📐 *Aproveitamento*\n\n'+e+' *Prazos em dia:* '+pct+'%\n   ✅ No prazo: '+(emExec.length-atr.length)+' · ⚠️ Atrasadas: '+atr.length+'\n\n🏗 *Em execução:* '+emExec.length+' obras · '+m2+'m²\n   📈 Progresso médio: '+prog+'%\n\n_'+new Date().toLocaleDateString('pt-BR')+'_';
-  } catch(e){return '❌ Erro: '+e.message;}
-}
+  '/gargalos': async (chatId) => {
+    const g = await getGargalos();
+    let msg = '🚧 *Gargalos Ativos*\n\n';
+    if (g.oe.length) msg += '*OPERAÇÕES:*\n' + g.oe.join('\n') + '\n\n';
+    if (g.oec.length) msg += '*CORES:*\n' + g.oec.join('\n');
+    return sendMsg(chatId, msg || 'Nenhum gargalo crítico no momento.');
+  },
 
-async function cmdStatus(nome){
-  if(!nome)return '❓ Use: `/status Nome do Cliente`\nEx: `/status Tally Feldman`';
-  try {
-    const projects=await planApi('/projects?limit=1037');
-    if(!projects)return '❌ Banco indisponível.';
-    const nL=nome.toLowerCase();
-    const proj=projects.find(p=>{const pN=(p.cliente?.nome||'').toLowerCase();return nL.split(' ').filter(w=>w.length>3).some(w=>pN.includes(w));});
-    if(!proj)return '🔍 Obra *"'+nome+'"* não encontrada. Tente parte do nome.';
-    const prg=proj.progress?.percentage||0;
-    const e=prg>=80?'🟢':prg>=50?'🟡':'🔴';
-    const st={em_execucao:'▶ Em execução',pausado:'⏸ Pausada',finalizado:'✅ Finalizada'}[proj.status]||proj.status;
-    let dc='—';
-    const de=proj.dataEntrada?.split(' ')[0];
-    if(de){const p=de.split('/');if(p.length===3)dc=Math.floor((hj()-new Date(p[2],p[1]-1,p[0]))/86400000)+'d';}
-    return '🏗 *'+esc(proj.cliente?.nome||nome)+'*\n\n'+e+' *Progresso:* '+prg+'%\n📍 *Status:* '+st+'\n📐 *Metragem:* '+(proj.projeto?.metragem||'—')+'m²\n🎨 *Cor:* '+esc((proj.projeto?.cores||[]).join(', ')||'—')+'\n📅 *Dias em campo:* '+dc+'\n📍 *Cidade:* '+esc(proj.projeto?.cidade||'—')+'\n\n[Ver no sistema ⇒](https://planejamento.monofloor.cloud/app/projeto/'+proj.id+')';
-  } catch(e){return '❌ Erro: '+e.message;}
-}
+  '/atrasadas': async (chatId) => {
+    const obras = await getAtrasadas();
+    if (!obras.length) return sendMsg(chatId, '✅ Nenhuma obra atrasada!');
+    let msg = `🔴 *Obras Atrasadas* (${obras.length})\n\n`;
+    obras.forEach(o => { msg += `• *${o.name || o.title}*\n`; });
+    return sendMsg(chatId, msg);
+  },
 
-async function cmdAlerta(){
-  try {
-    const ctx=await processarMensagemNatural('alerta urgente critico atrasadas gargalos pausadas');
-    if(!ANTHROPIC_KEY||ANTHROPIC_KEY.includes('SUBSTITUIR')){
-      const g=await buscarGargalos();const atr=await buscarObrasAtrasadas();
-      let msg='🚨 *Alertas*\n\n';
-      if(g.g1?.cards_count>200)msg+='🔴 G1 crítico: *'+g.g1.cards_count+' cards*\n';
-      const crit=atr.filter(o=>o.diasAtraso>90);
-      if(crit.length)msg+='🔴 *'+crit.length+' obra(s)* com +90d de atraso\n';
-      return msg||'✅ Sem alertas críticos agora.';
+  '/aproveitamento': async (chatId) => {
+    const a = await getAproveitamento();
+    const emoji = a.pct >= 80 ? '🟢' : a.pct >= 60 ? '🟡' : '🔴';
+    return sendMsg(chatId, `${emoji} *Aproveitamento: ${a.pct}%*\n\n${a.onTime} de ${a.total} obras no prazo.`);
+  },
+
+  '/alerta': async (chatId) => {
+    const [g, a] = await Promise.all([getGargalos(), getAtrasadas()]);
+    let msg = '🚨 *Painel de Alertas*\n\n';
+    msg += `• ${a.length} obras atrasadas\n`;
+    msg += `• ${g.oe.length + g.oec.length} gargalos ativos\n`;
+
+    // Include telegram signals
+    const signals = Object.entries(obraStatus).filter(([, v]) => v.statusReal === 'finalizado' || v.statusReal === 'pausa');
+    if (signals.length) {
+      msg += `\n✈️ *Sinais do Telegram:*\n`;
+      signals.forEach(([, v]) => {
+        const emoji = v.statusReal === 'finalizado' ? '✅' : '⏸️';
+        msg += `${emoji} ${v.ultimoSinal.mensagem.substring(0, 60)}...\n`;
+      });
     }
-    return await claudeAI('O que precisa de atenção urgente na operação hoje?',ctx);
-  } catch(e){return '❌ Erro: '+e.message;}
-}
+    return sendMsg(chatId, msg);
+  },
 
-async function cmdSemana(){
-  try {
-    const ctx=await processarMensagemNatural('resumo semanal gargalos atrasadas execucao');
-    if(!ANTHROPIC_KEY||ANTHROPIC_KEY.includes('SUBSTITUIR'))return '⚠️ Configure ANTHROPIC_API_KEY no Railway para o resumo semanal.\n\nUse `/aproveitamento` para dados estruturados.';
-    return await claudeAI('Gere um resumo semanal executivo da operação para Vitor Gomes com: situação geral, principal alerta e uma ação prioritária para os próximos 3 dias. Use emojis. Máximo 250 palavras.',ctx);
-  } catch(e){return '❌ Erro: '+e.message;}
-}
+  '/status': async (chatId, args) => {
+    if (!args) return sendMsg(chatId, 'Use: /status [nome do cliente]');
+    try {
+      const r = await fetch(`${PLAN_URL}/projects?limit=500`);
+      const d = await r.json();
+      const projects = d.projects || d || [];
+      const found = projects.filter(p => (p.name || p.title || '').toLowerCase().includes(args.toLowerCase()));
+      if (!found.length) return sendMsg(chatId, `Nenhuma obra encontrada para "${args}".`);
+      let msg = '';
+      found.slice(0, 5).forEach(p => { msg += `📋 *${p.name || p.title}*\nStatus: ${p.status || '—'}\n\n`; });
+      return sendMsg(chatId, msg);
+    } catch { return sendMsg(chatId, 'Erro ao consultar planejamento.'); }
+  },
 
-app.post('/webhook',async(req,res)=>{
+  '/ocorrencias': async (chatId) => {
+    const ocs = ocorrencias[chatId];
+    if (!ocs || !ocs.length) return sendMsg(chatId, '📋 Nenhuma ocorrência registrada neste grupo.');
+    let msg = `📋 *Ocorrências Registradas* (${ocs.length})\n\n`;
+    ocs.slice(-10).forEach(o => {
+      const data = new Date(o.data).toLocaleDateString('pt-BR');
+      msg += `${KEYWORDS[o.tipo]?.label || o.tipo} — ${data}\n_${o.mensagem.substring(0, 60)}_\n\n`;
+    });
+    return sendMsg(chatId, msg);
+  },
+
+  '/resumo': async (chatId) => {
+    const ocs = ocorrencias[chatId] || [];
+    const status = obraStatus[chatId];
+    const dias = diasRegistro[chatId] || {};
+    const totalDias = Object.keys(dias).length;
+
+    let msg = '📊 *Resumo da Obra*\n\n';
+    msg += `📅 Dias com registro: *${totalDias}*\n`;
+    msg += `📋 Total ocorrências: *${ocs.length}*\n`;
+
+    // Count by type
+    const byType = {};
+    ocs.forEach(o => { byType[o.tipo] = (byType[o.tipo] || 0) + 1; });
+    Object.entries(byType).forEach(([tipo, count]) => {
+      msg += `   ${KEYWORDS[tipo]?.label || tipo}: ${count}\n`;
+    });
+
+    if (status) {
+      msg += `\n✈️ Status real: *${status.statusReal.toUpperCase()}*`;
+    }
+    return sendMsg(chatId, msg);
+  },
+
+  '/ajuda': async (chatId) => {
+    return sendMsg(chatId, `🤖 *Teleagente Monofloor*\n\n` +
+      `*Comandos:*\n` +
+      `/obras — Obras em execução\n` +
+      `/gargalos — Gargalos ativos\n` +
+      `/atrasadas — Obras atrasadas\n` +
+      `/aproveitamento — Taxa no prazo\n` +
+      `/alerta — Painel de alertas\n` +
+      `/status [nome] — Buscar obra\n` +
+      `/ocorrencias — Histórico do grupo\n` +
+      `/resumo — Resumo da obra\n\n` +
+      `*Classificação manual:*\n` +
+      `/diario [texto] — Registrar diário\n` +
+      `/ocorrencia [tipo] — Registrar evento\n` +
+      `/finalizar — Marcar como concluída\n` +
+      `/pausa [motivo] — Pausar obra\n` +
+      `/retomar — Retomar obra\n\n` +
+      `*Modo Ativo (proativo):*\n` +
+      `/briefing — Disparar briefing matinal agora\n` +
+      `/digest — Disparar digest diário agora\n` +
+      `/grupos — Ver grupos rastreados\n\n` +
+      `*Tipos de ocorrência:*\n` +
+      `sem\\_aplicador, qualidade, comunicacao, cliente, clima, material\n\n` +
+      `🤖 Detecção automática ativa em grupos de obra.`
+    );
+  },
+
+  '/diario': async (chatId, args, from) => {
+    if (!args) return sendMsg(chatId, 'Use: /diario [descrição do que foi executado hoje]');
+    registrarOcorrencia(chatId, 'diario', args, from, ['diário manual']);
+    return sendMsg(chatId, '📸 Diário registrado!');
+  },
+
+  '/ocorrencia': async (chatId, args, from) => {
+    if (!args) return sendMsg(chatId, 'Use: /ocorrencia [tipo] [descrição]\nTipos: sem_aplicador, qualidade, comunicacao, cliente, clima, material');
+    const parts = args.split(' ');
+    const tipo = parts[0];
+    const desc = parts.slice(1).join(' ') || 'Sem descrição';
+    if (!KEYWORDS[tipo] && tipo !== 'material') return sendMsg(chatId, `Tipo "${tipo}" não reconhecido.\nTipos válidos: sem_aplicador, qualidade, comunicacao, cliente, clima, material`);
+    const tipoFinal = tipo === 'material' ? 'material_extra' : tipo;
+    registrarOcorrencia(chatId, tipoFinal, desc, from, ['comando manual']);
+    return sendMsg(chatId, `${KEYWORDS[tipoFinal]?.label || tipo} registrado!`);
+  },
+
+  '/finalizar': async (chatId, args, from) => {
+    registrarOcorrencia(chatId, 'finalizado', args || 'Obra finalizada via comando', from, ['comando /finalizar']);
+    return sendMsg(chatId, '✅ *Obra marcada como FINALIZADA!*\n\n⚠️ Lembre de mover o card no Pipefy para "Obra Concluída".');
+  },
+
+  '/pausa': async (chatId, args, from) => {
+    registrarOcorrencia(chatId, 'pausa', args || 'Obra pausada via comando', from, ['comando /pausa']);
+    return sendMsg(chatId, '⏸️ *Obra marcada como PAUSADA!*\nMotivo: ' + (args || 'Não informado'));
+  },
+
+  '/retomar': async (chatId, args, from) => {
+    if (obraStatus[chatId]?.statusReal === 'pausa') {
+      delete obraStatus[chatId];
+    }
+    registrarOcorrencia(chatId, 'diario', 'Obra retomada' + (args ? ': ' + args : ''), from, ['comando /retomar']);
+    return sendMsg(chatId, '▶️ *Obra RETOMADA!*');
+  },
+
+  '/semana': async (chatId) => {
+    const [obras, atrasadas, aproveitamento] = await Promise.all([
+      getObrasExecucao(),
+      getAtrasadas(),
+      getAproveitamento(),
+    ]);
+    const prompt = `Dados Monofloor esta semana:
+- ${obras.length} obras em execução
+- ${atrasadas.length} atrasadas
+- Aproveitamento: ${aproveitamento.pct}%
+Gere um resumo executivo semanal em português, direto e objetivo, com emojis.`;
+    const resp = await ai(prompt);
+    return sendMsg(chatId, resp);
+  },
+
+  '/briefing': async (chatId) => {
+    await briefingMatinal();
+    if (chatId !== parseInt(VITOR_CHAT_ID)) {
+      return sendMsg(chatId, '🌅 Briefing disparado! Enviado para o chat do Vitor.');
+    }
+  },
+
+  '/id': async (chatId) => {
+    return sendMsg(chatId, `🆔 Seu Chat ID: \`${chatId}\`\n\nAdicione como VITOR_CHAT_ID no Railway para receber briefings.`);
+  },
+
+  '/digest': async (chatId) => {
+    await digestDiario();
+    if (chatId !== parseInt(VITOR_CHAT_ID)) {
+      return sendMsg(chatId, '📊 Digest disparado! Enviado para o chat do Vitor.');
+    }
+  },
+
+  '/grupos': async (chatId) => {
+    const groups = Object.entries(trackedGroups);
+    if (!groups.length) return sendMsg(chatId, 'Nenhum grupo rastreado ainda. O bot registra automaticamente ao receber mensagens em grupos.');
+    let msg = `📡 *Grupos Rastreados* (${groups.length})\n\n`;
+    groups.forEach(([id, g]) => {
+      const lastAct = new Date(g.lastActivity).toLocaleString('pt-BR');
+      msg += `• *${g.name}*\n  Última atividade: ${lastAct}\n\n`;
+    });
+    return sendMsg(chatId, msg);
+  },
+};
+
+// ── WEBHOOK HANDLER ────────────────────────────────────────────────
+
+app.post('/webhook', async (req, res) => {
   res.sendStatus(200);
-  const msg=req.body?.message;
-  if(!msg?.text)return;
-  const chatId=msg.chat.id,text=msg.text.trim();
-  const [cmd,...args]=text.split(' ');const arg=args.join(' ').trim();
-  console.log('[MSG] "'+text+'" | chat: '+chatId);
+
   try {
-    let resposta;
-    switch(cmd.toLowerCase()){
-      case'/start':case'/ajuda':case'/help': resposta=cmdAjuda();break;
-      case'/obras': resposta=await cmdObras();break;
-      case'/pausadas': resposta=await cmdPausadas();break;
-      case'/gargalos': resposta=await cmdGargalos();break;
-      case'/atrasadas': resposta=await cmdAtrasadas();break;
-      case'/aproveitamento': resposta=await cmdAproveitamento();break;
-      case'/alerta': resposta=await cmdAlerta();break;
-      case'/status': resposta=await cmdStatus(arg);break;
-      case'/semana': resposta=await cmdSemana();break;    case'/meuid': resposta='🆔 Chat ID: '+chatId+' | User: '+from.id;break;
-      default:
-        if(!text.startsWith('/')){
-          if(!ANTHROPIC_KEY||ANTHROPIC_KEY.includes('SUBSTITUIR')){
-            resposta='⚠️ Para respostas inteligentes, configure a ANTHROPIC_API_KEY no Railway.\n\nUse */ajuda* para ver os comandos.';
-          } else {
-            const ctx=await processarMensagemNatural(text);
-            resposta=await claudeAI(text,ctx);
-          }
-        } else {
-          resposta='❌ Comando não reconhecido. Use */ajuda*';
-        }
+    const msg = req.body.message;
+    if (!msg) return;
+
+    const chatId = msg.chat.id;
+    const text = msg.text || '';
+    const from = msg.from?.first_name || 'Desconhecido';
+    const isGroup = msg.chat.type === 'group' || msg.chat.type === 'supergroup';
+
+    // ── AUTO-TRACK GROUPS ──
+    if (isGroup) {
+      trackedGroups[chatId] = {
+        name: msg.chat.title || `Grupo ${chatId}`,
+        lastActivity: new Date().toISOString(),
+        lastMessage: text.substring(0, 100),
+        registered: trackedGroups[chatId]?.registered || new Date().toISOString(),
+      };
     }
-    await send(chatId,resposta);
-  } catch(e){console.error('[ERROR]',e.message);await send(chatId,'❌ Erro interno: '+e.message);}
+
+    // ── COMMAND HANDLING ──
+    if (text.startsWith('/')) {
+      const parts = text.split(' ');
+      const cmd = parts[0].split('@')[0].toLowerCase(); // Remove @botname
+      const args = parts.slice(1).join(' ');
+      const handler = commands[cmd];
+      if (handler) {
+        await handler(chatId, args, from);
+      }
+      return;
+    }
+
+    // ── GROUP MESSAGE: KEYWORD DETECTION ──
+    if (isGroup && text.length > 5) {
+      const matches = detectKeywords(text);
+
+      if (matches.length > 0) {
+        const primary = matches[0]; // Highest priority match
+
+        // Register the occurrence
+        registrarOcorrencia(chatId, primary.tipo, text, from, primary.keywords);
+
+        // Send confirmation (except for diários — too noisy)
+        if (primary.resposta) {
+          const kwList = primary.keywords.slice(0, 3).map(k => `\`${k}\``).join(', ');
+          await sendMsg(chatId,
+            `${primary.resposta}\n\n` +
+            `👤 ${from}\n` +
+            `🔑 Keywords: ${kwList}\n` +
+            `📋 Total ocorrências: ${(ocorrencias[chatId] || []).length}`,
+            { reply_to_message_id: msg.message_id }
+          );
+        }
+
+        // If it's a finalization, add extra reminder
+        if (primary.tipo === 'finalizado') {
+          setTimeout(() => {
+            sendMsg(chatId, '⚠️ *Lembrete:* Mova o card no Pipefy para "Obra Concluída" para sincronizar o status.');
+          }, 3000);
+        }
+      } else {
+        // Mark day as having activity (even without keyword match)
+        const hoje = new Date().toISOString().split('T')[0];
+        if (!diasRegistro[chatId]) diasRegistro[chatId] = {};
+        diasRegistro[chatId][hoje] = true;
+      }
+      return;
+    }
+
+    // ── PRIVATE MESSAGE: AI CHAT ──
+    if (!isGroup && !text.startsWith('/')) {
+      const resp = await ai(
+        `Você é o Teleagente da Monofloor, assistente operacional de piso de concreto polido. ` +
+        `Vitor Gomes (Gerente de Qualidade) perguntou: "${text}". ` +
+        `Responda direto em português, objetivo e com emojis quando apropriado.`
+      );
+      await sendMsg(chatId, resp);
+    }
+  } catch (err) {
+    console.error('Webhook error:', err);
+  }
 });
 
-app.get('/',(req,res)=>res.json({status:'ok',service:'Teleagente Monofloor',version:'2.0.0-B',timestamp:new Date().toISOString()}));
+// ── HEALTH CHECK + API ─────────────────────────────────────────────
 
-app.listen(PORT,()=>{
-  console.log('🤖 Teleagente v2.0 rodando na porta '+PORT);
-  if(!BOT_TOKEN)console.warn('⚠️ TELEGRAM_BOT_TOKEN não configurado');
-  if(!PIPEFY_TOKEN)console.warn('⚠️ PIPEFY_TOKEN não configurado');
-  if(!ANTHROPIC_KEY||ANTHROPIC_KEY.includes('SUBSTITUIR'))console.warn('⚠️ ANTHROPIC_API_KEY não configurado');
-});h
+app.get('/', (req, res) => {
+  res.json({
+    status: 'online',
+    bot: '@monofloor_op_bot',
+    version: '2.1.0-ativo',
+    features: ['commands', 'keyword_detection', 'classification', 'ai_chat', 'proactive_briefing', 'dia_cego_detection', 'prazo_alerts', 'daily_digest'],
+    ocorrencias: Object.keys(ocorrencias).length + ' groups tracked',
+    sinais: Object.keys(obraStatus).length + ' status overrides',
+  });
+});
+
+// API endpoint for the portal to consume
+app.get('/api/ocorrencias', (req, res) => {
+  res.json(ocorrencias);
+});
+
+app.get('/api/status', (req, res) => {
+  res.json(obraStatus);
+});
+
+app.get('/api/dias', (req, res) => {
+  res.json(diasRegistro);
+});
+
+// ══════════════════════════════════════════════════════════════════
+// MODO ATIVO — AÇÕES PROATIVAS DO BOT
+// O bot toma iniciativa: briefings, alertas, follow-ups
+// ══════════════════════════════════════════════════════════════════
+
+// ── BRIEFING MATINAL (8h) ──────────────────────────────────────────
+async function briefingMatinal() {
+  if (!VITOR_CHAT_ID) return console.log('VITOR_CHAT_ID não configurado — briefing ignorado');
+  try {
+    const obras = await getObrasExecucao();
+    const hoje = new Date().toISOString().split('T')[0];
+    const ontem = new Date(Date.now() - 86400000).toISOString().split('T')[0];
+
+    // Dias cegos de ontem
+    const gruposSilenciosos = Object.entries(trackedGroups).filter(([chatId]) => {
+      const dias = diasRegistro[chatId] || {};
+      return !dias[ontem];
+    });
+
+    // Obras atrasadas (prazo estourado)
+    const atrasadas = obras.filter(o => {
+      if (!o.due) return false;
+      return new Date(o.due) < new Date();
+    });
+
+    // Sinais do Telegram
+    const sinais = Object.entries(obraStatus);
+
+    let msg = `🌅 *Briefing Matinal — ${new Date().toLocaleDateString('pt-BR')}*\n\n`;
+    msg += `🔨 *${obras.length}* obras em execução\n`;
+    msg += `🔴 *${atrasadas.length}* além do prazo\n`;
+    msg += `👁️ *${gruposSilenciosos.length}* grupos sem registro ontem\n`;
+
+    if (sinais.length) {
+      msg += `\n✈️ *Sinais Telegram pendentes:*\n`;
+      sinais.forEach(([, v]) => {
+        const emoji = v.statusReal === 'finalizado' ? '✅' : '⏸️';
+        msg += `${emoji} ${v.ultimoSinal.mensagem.substring(0, 50)}...\n`;
+      });
+    }
+
+    if (gruposSilenciosos.length) {
+      msg += `\n👁️ *Grupos silenciosos ontem:*\n`;
+      gruposSilenciosos.slice(0, 5).forEach(([, g]) => {
+        msg += `• ${g.name}\n`;
+      });
+    }
+
+    if (atrasadas.length) {
+      msg += `\n🔴 *Obras além do prazo:*\n`;
+      atrasadas.slice(0, 5).forEach(o => {
+        msg += `• *${o.title}* — ${o.age}d na fase (prazo: ${o.prazo || '—'}d)\n`;
+      });
+    }
+
+    msg += `\n_Próximo briefing amanhã às 8h._`;
+    await sendMsg(VITOR_CHAT_ID, msg);
+    console.log(`[ATIVO] Briefing matinal enviado — ${obras.length} obras, ${atrasadas.length} atrasadas`);
+  } catch (e) { console.error('[ATIVO] Erro no briefing:', e.message); }
+}
+
+// ── DETECTOR DE DIA CEGO (20h) ─────────────────────────────────────
+async function detectarDiasCegos() {
+  const hoje = new Date().toISOString().split('T')[0];
+  let alertados = 0;
+
+  for (const [chatId, grupo] of Object.entries(trackedGroups)) {
+    const dias = diasRegistro[chatId] || {};
+    if (!dias[hoje]) {
+      // Grupo ficou em silêncio o dia inteiro
+      registrarOcorrencia(chatId, 'dia_cego', 'Nenhum registro detectado hoje (automático)', 'Teleagente', ['dia cego', 'silêncio']);
+
+      await sendMsg(chatId,
+        `👁️ *Dia sem registro detectado!*\n\n` +
+        `Nenhuma mensagem foi registrada no grupo hoje.\n` +
+        `Se a obra está ativa, como está o andamento?\n\n` +
+        `_Registrado automaticamente como "dia cego"._`
+      );
+      alertados++;
+
+      // Pausa entre mensagens para não ser rate-limited
+      await new Promise(r => setTimeout(r, 1000));
+    }
+  }
+
+  // Verificar silêncio de 2+ dias consecutivos
+  for (const [chatId, grupo] of Object.entries(trackedGroups)) {
+    const dias = diasRegistro[chatId] || {};
+    const ontem = new Date(Date.now() - 86400000).toISOString().split('T')[0];
+    if (!dias[hoje] && !dias[ontem]) {
+      await sendMsg(chatId,
+        `🔇 *Silêncio prolongado — 2 dias sem registro*\n\n` +
+        `Este grupo está sem atividade há 2 dias.\n` +
+        `A obra está pausada? Use /pausa [motivo]\n` +
+        `Ainda ativa? Envie um /diario com o status.`
+      );
+      await new Promise(r => setTimeout(r, 1000));
+    }
+  }
+
+  console.log(`[ATIVO] Dia cego check — ${alertados} grupos alertados de ${Object.keys(trackedGroups).length}`);
+}
+
+// ── ALERTA DE PRAZO (diário) ───────────────────────────────────────
+async function alertaPrazo() {
+  try {
+    const obras = await getObrasExecucao();
+    const hoje = new Date();
+
+    for (const obra of obras) {
+      if (!obra.due) continue;
+      const prazoDate = new Date(obra.due);
+      const diasRestantes = Math.round((prazoDate - hoje) / 86400000);
+
+      // Encontrar grupo correspondente pelo nome
+      const grupoMatch = Object.entries(trackedGroups).find(([, g]) =>
+        g.name.toLowerCase().includes(obra.title.toLowerCase().substring(0, 15))
+      );
+
+      if (diasRestantes === 3 && grupoMatch) {
+        await sendMsg(grupoMatch[0],
+          `⏰ *Alerta de Prazo — 3 dias restantes*\n\n` +
+          `A obra *${obra.title}* tem prazo previsto para ${prazoDate.toLocaleDateString('pt-BR')}.\n` +
+          `Faltam *3 dias*. Status atual: ${obra.age}d na fase.`
+        );
+      } else if (diasRestantes === 1 && grupoMatch) {
+        await sendMsg(grupoMatch[0],
+          `🚨 *Prazo AMANHÃ!*\n\n` +
+          `A obra *${obra.title}* precisa ser finalizada até amanhã (${prazoDate.toLocaleDateString('pt-BR')}).`
+        );
+      } else if (diasRestantes === 0 && grupoMatch) {
+        await sendMsg(grupoMatch[0],
+          `🔴 *PRAZO ESGOTADO HOJE!*\n\n` +
+          `A obra *${obra.title}* deveria ter sido finalizada hoje.\n` +
+          `Use /finalizar quando concluir ou /pausa se houver impedimento.`
+        );
+      }
+
+      if (grupoMatch) await new Promise(r => setTimeout(r, 500));
+    }
+
+    console.log(`[ATIVO] Alerta de prazo — ${obras.length} obras verificadas`);
+  } catch (e) { console.error('[ATIVO] Erro no alerta de prazo:', e.message); }
+}
+
+// ── DIGEST DIÁRIO (18h) ────────────────────────────────────────────
+async function digestDiario() {
+  if (!VITOR_CHAT_ID) return;
+  try {
+    const hoje = new Date().toISOString().split('T')[0];
+    let totalOcs = 0;
+    const resumoPorTipo = {};
+    const gruposAtivos = [];
+
+    for (const [chatId, ocs] of Object.entries(ocorrencias)) {
+      const ocsHoje = ocs.filter(o => o.data.startsWith(hoje));
+      if (ocsHoje.length > 0) {
+        totalOcs += ocsHoje.length;
+        gruposAtivos.push(trackedGroups[chatId]?.name || chatId);
+        ocsHoje.forEach(o => { resumoPorTipo[o.tipo] = (resumoPorTipo[o.tipo] || 0) + 1; });
+      }
+    }
+
+    if (totalOcs === 0) {
+      await sendMsg(VITOR_CHAT_ID, `📊 *Digest Diário — ${new Date().toLocaleDateString('pt-BR')}*\n\nNenhuma ocorrência registrada hoje.`);
+      return;
+    }
+
+    let msg = `📊 *Digest Diário — ${new Date().toLocaleDateString('pt-BR')}*\n\n`;
+    msg += `📋 *${totalOcs}* ocorrências em *${gruposAtivos.length}* grupos\n\n`;
+
+    msg += `*Por tipo:*\n`;
+    for (const [tipo, count] of Object.entries(resumoPorTipo).sort((a, b) => b[1] - a[1])) {
+      msg += `${KEYWORDS[tipo]?.label || tipo}: *${count}*\n`;
+    }
+
+    msg += `\n*Grupos ativos hoje:*\n`;
+    gruposAtivos.slice(0, 8).forEach(g => { msg += `• ${g}\n`; });
+
+    msg += `\n_Próximo digest amanhã às 18h._`;
+    await sendMsg(VITOR_CHAT_ID, msg);
+    console.log(`[ATIVO] Digest enviado — ${totalOcs} ocorrências`);
+  } catch (e) { console.error('[ATIVO] Erro no digest:', e.message); }
+}
+
+// ── SCHEDULER ──────────────────────────────────────────────────────
+
+function getBRTime() {
+  // Horário de Brasília (UTC-3)
+  const now = new Date();
+  const utcOffset = now.getTimezoneOffset() * 60000;
+  const brOffset = -3 * 3600000;
+  return new Date(now.getTime() + utcOffset + brOffset);
+}
+
+function startSchedulers() {
+  // Check every 5 minutes if it's time to run a task
+  setInterval(() => {
+    const br = getBRTime();
+    const h = br.getHours();
+    const m = br.getMinutes();
+
+    // 08:00 — Briefing matinal (run between 08:00-08:04)
+    if (h === 8 && m < 5) {
+      briefingMatinal();
+    }
+
+    // 12:00 — Alerta de prazo (midday check)
+    if (h === 12 && m < 5) {
+      alertaPrazo();
+    }
+
+    // 18:00 — Digest diário
+    if (h === 18 && m < 5) {
+      digestDiario();
+    }
+
+    // 20:00 — Detector de dia cego
+    if (h === 20 && m < 5) {
+      detectarDiasCegos();
+    }
+  }, 5 * 60 * 1000); // Every 5 minutes
+
+  console.log('[ATIVO] Schedulers iniciados — Briefing 8h | Prazo 12h | Digest 18h | Dia Cego 20h');
+}
+
+// API — tracked groups
+app.get('/api/groups', (req, res) => {
+  res.json(trackedGroups);
+});
+
+// ── START ──────────────────────────────────────────────────────────
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Teleagente v2.1 ATIVO — port ${PORT}`);
+  console.log(`Keywords: ${Object.values(KEYWORDS).reduce((s, k) => s + k.palavras.length, 0)} mapped`);
+  console.log(`Types: ${Object.keys(KEYWORDS).length}`);
+  console.log(`VITOR_CHAT_ID: ${VITOR_CHAT_ID ? 'configurado' : '⚠️ NÃO CONFIGURADO'}`);
+
+  // Start proactive schedulers
+  startSchedulers();
+
+  // Run initial briefing 30s after boot (for testing)
+  if (VITOR_CHAT_ID) {
+    setTimeout(() => {
+      sendMsg(VITOR_CHAT_ID,
+        `🤖 *Teleagente v2.1 ATIVO*\n\n` +
+        `Bot reiniciado e online.\n` +
+        `Modo ativo habilitado:\n` +
+        `• 🌅 Briefing matinal às 8h\n` +
+        `• ⏰ Alerta de prazo às 12h\n` +
+        `• 📊 Digest diário às 18h\n` +
+        `• 👁️ Dia cego check às 20h\n\n` +
+        `Grupos rastreados: ${Object.keys(trackedGroups).length}`
+      );
+    }, 30000);
+  }
+});
