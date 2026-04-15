@@ -876,6 +876,204 @@ app.get('/api/dias', (req, res) => {
   res.json(diasRegistro);
 });
 
+// ── ANÁLISE MASSIVA — EXTRAÇÃO COMPLETA DA KIRA ──────────────────
+app.get('/api/analise', async (req, res) => {
+  try {
+    const inicio = Date.now();
+    const limite = parseInt(req.query.limit) || 500;
+    const apenasAtivos = req.query.ativos !== 'false'; // default: só ativos
+
+    // 1. Buscar todos os projetos
+    const rProj = await fetch(`${KIRA_URL}/projects?limit=${limite}`);
+    const allProjects = await rProj.json();
+    const projects = Array.isArray(allProjects) ? allProjects : (allProjects.projects || []);
+
+    // Filtrar se necessário
+    const statusFinais = ['finalizado', 'concluido', 'cancelado'];
+    const projetosAlvo = apenasAtivos
+      ? projects.filter(p => !statusFinais.includes(p.status))
+      : projects;
+
+    console.log(`[ANALISE] ${projetosAlvo.length} projetos alvo de ${projects.length} total`);
+
+    // 2. Para cada projeto, buscar mensagens e alertas (batched)
+    const batchSize = 5;
+    const resultados = [];
+
+    for (let i = 0; i < projetosAlvo.length; i += batchSize) {
+      const batch = projetosAlvo.slice(i, i + batchSize);
+      const batchResults = await Promise.all(batch.map(async (proj) => {
+        const pid = proj.id;
+        let msgs = [], alertas = [], ocs = [], materiais = [];
+
+        try {
+          const [rMsgs, rAlerts, rOcs, rMat] = await Promise.allSettled([
+            fetch(`${KIRA_URL}/projects/${pid}/messages?source=all&limit=200`).then(r => r.ok ? r.json() : []),
+            fetch(`${KIRA_URL}/projects/${pid}/alerts`).then(r => r.ok ? r.json() : []),
+            fetch(`${KIRA_URL}/projects/${pid}/ocorrencias`).then(r => r.ok ? r.json() : []),
+            fetch(`${KIRA_URL}/projects/${pid}/materiais`).then(r => r.ok ? r.json() : []),
+          ]);
+          msgs = rMsgs.status === 'fulfilled' ? (Array.isArray(rMsgs.value) ? rMsgs.value : rMsgs.value.messages || rMsgs.value || []) : [];
+          alertas = rAlerts.status === 'fulfilled' ? (Array.isArray(rAlerts.value) ? rAlerts.value : rAlerts.value.alerts || []) : [];
+          ocs = rOcs.status === 'fulfilled' ? (Array.isArray(rOcs.value) ? rOcs.value : rOcs.value.ocorrencias || []) : [];
+          materiais = rMat.status === 'fulfilled' ? (Array.isArray(rMat.value) ? rMat.value : rMat.value.materiais || []) : [];
+        } catch (e) {
+          console.error(`[ANALISE] Erro projeto ${pid}:`, e.message);
+        }
+
+        // Filtrar mensagens últimos 30 dias
+        const agora = new Date();
+        const dias30 = new Date(agora.getTime() - 30 * 86400000);
+        const msgsRecentes = msgs.filter(m => {
+          const d = m.date || m.data || m.createdAt;
+          return d && new Date(d) >= dias30;
+        });
+
+        // Separar TG e WA
+        const msgsTG = msgsRecentes.filter(m => (m.source || '').toLowerCase().includes('telegram'));
+        const msgsWA = msgsRecentes.filter(m => (m.source || '').toLowerCase().includes('whatsapp'));
+
+        // Atividade por dia (últimos 30d)
+        const atividadePorDia = {};
+        msgsRecentes.forEach(m => {
+          const d = (m.date || m.data || m.createdAt || '').substring(0, 10);
+          if (d) atividadePorDia[d] = (atividadePorDia[d] || 0) + 1;
+        });
+
+        // Dias com atividade vs dias sem
+        const diasComAtividade = Object.keys(atividadePorDia).length;
+        const diasSemAtividade = 30 - diasComAtividade;
+
+        // Autores únicos
+        const autores = new Set();
+        msgsRecentes.forEach(m => {
+          const a = m.author || m.autor || m.from;
+          if (a) autores.add(a);
+        });
+
+        return {
+          id: pid,
+          clienteNome: proj.clienteNome,
+          projetoCidade: proj.projetoCidade,
+          projetoMetragem: proj.projetoMetragem,
+          projetoCores: proj.projetoCores,
+          tipoObra: proj.tipoObra,
+          status: proj.status,
+          faseAtual: proj.faseAtual,
+          consultorNome: proj.consultorNome,
+          dataExecucaoPrevista: proj.dataExecucaoPrevista,
+          createdAt: proj.createdAt,
+          // Métricas de mensagens
+          totalMensagens30d: msgsRecentes.length,
+          mensagensTG: msgsTG.length,
+          mensagensWA: msgsWA.length,
+          totalMensagensHistorico: msgs.length,
+          diasComAtividade,
+          diasSemAtividade,
+          autoresUnicos: autores.size,
+          autoresLista: [...autores],
+          atividadePorDia,
+          // Alertas e ocorrências
+          totalAlertas: alertas.length,
+          alertas: alertas.slice(0, 10),
+          totalOcorrencias: ocs.length,
+          ocorrencias: ocs.slice(0, 10),
+          totalMateriais: materiais.length,
+          materiais: materiais.slice(0, 10),
+          // Última mensagem
+          ultimaMensagem: msgsRecentes[0] ? {
+            data: msgsRecentes[0].date || msgsRecentes[0].data,
+            autor: msgsRecentes[0].author || msgsRecentes[0].autor,
+            texto: (msgsRecentes[0].content || msgsRecentes[0].text || '').substring(0, 100),
+            source: msgsRecentes[0].source,
+          } : null,
+        };
+      }));
+      resultados.push(...batchResults);
+
+      // Rate limit: wait 500ms between batches
+      if (i + batchSize < projetosAlvo.length) {
+        await new Promise(r => setTimeout(r, 500));
+      }
+    }
+
+    // 3. Computar agregados
+    const totalMsgs30d = resultados.reduce((s, r) => s + r.totalMensagens30d, 0);
+    const projetosComMsg = resultados.filter(r => r.totalMensagens30d > 0).length;
+    const projetosSemMsg = resultados.filter(r => r.totalMensagens30d === 0).length;
+
+    // Top projetos por mensagens
+    const topPorMsgs = [...resultados].sort((a, b) => b.totalMensagens30d - a.totalMensagens30d).slice(0, 20);
+
+    // Projetos silenciosos (ativos mas sem msgs)
+    const silenciosos = resultados
+      .filter(r => r.totalMensagens30d === 0 && !statusFinais.includes(r.status))
+      .map(r => ({ nome: r.clienteNome, status: r.status, fase: r.faseAtual }));
+
+    // Agregados por consultor
+    const porConsultor = {};
+    resultados.forEach(r => {
+      const c = (r.consultorNome || '').trim() || 'SEM CONSULTOR';
+      if (!porConsultor[c]) porConsultor[c] = { obras: 0, msgs: 0, alertas: 0, ocs: 0 };
+      porConsultor[c].obras++;
+      porConsultor[c].msgs += r.totalMensagens30d;
+      porConsultor[c].alertas += r.totalAlertas;
+      porConsultor[c].ocs += r.totalOcorrencias;
+    });
+
+    // Agregados por cidade
+    const porCidade = {};
+    resultados.forEach(r => {
+      let c = (r.projetoCidade || '?').toUpperCase();
+      if (c.includes('SÃO PAULO') || c.includes('SAO PAULO')) c = 'SP';
+      else if (c.includes('RIO')) c = 'RJ';
+      else if (c.includes('CURITIBA')) c = 'CWB';
+      else c = 'OUT';
+      if (!porCidade[c]) porCidade[c] = { obras: 0, msgs: 0, alertas: 0 };
+      porCidade[c].obras++;
+      porCidade[c].msgs += r.totalMensagens30d;
+      porCidade[c].alertas += r.totalAlertas;
+    });
+
+    const duracao = ((Date.now() - inicio) / 1000).toFixed(1);
+
+    res.json({
+      meta: {
+        geradoEm: new Date().toISOString(),
+        duracaoSegundos: parseFloat(duracao),
+        totalProjetos: projects.length,
+        projetosAnalisados: projetosAlvo.length,
+        projetosComDados: resultados.length,
+        periodo: 'últimos 30 dias',
+      },
+      resumo: {
+        totalMensagens30d: totalMsgs30d,
+        projetosComMensagens: projetosComMsg,
+        projetosSemMensagens: projetosSemMsg,
+        projetosSilenciosos: silenciosos.length,
+      },
+      porConsultor,
+      porCidade,
+      topPorMensagens: topPorMsgs.map(r => ({
+        nome: r.clienteNome,
+        msgs30d: r.totalMensagens30d,
+        tg: r.mensagensTG,
+        wa: r.mensagensWA,
+        alertas: r.totalAlertas,
+        autores: r.autoresUnicos,
+        fase: r.faseAtual,
+      })),
+      silenciosos: silenciosos.slice(0, 30),
+      projetos: resultados,
+    });
+
+    console.log(`[ANALISE] Completa em ${duracao}s — ${resultados.length} projetos, ${totalMsgs30d} msgs`);
+  } catch (e) {
+    console.error('[ANALISE] Erro:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ══════════════════════════════════════════════════════════════════
 // MODO ATIVO — AÇÕES PROATIVAS DO BOT
 // O bot toma iniciativa: briefings, alertas, follow-ups
