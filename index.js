@@ -414,11 +414,11 @@ const commands = {
       resp += `📊 Últimas ${Math.min(msgs.length, 15)} mensagens:\n\n`;
 
       msgs.slice(0, 15).forEach(m => {
-        const source = (m.source || m.tipo || '').toUpperCase().substring(0, 2);
+        const source = (m.source || '').toUpperCase().substring(0, 2);
         const badge = source === 'TE' ? '🔵' : source === 'WH' ? '🟢' : '⚪';
-        const data = m.date || m.data || m.createdAt || '';
+        const data = m.timestamp || m.date || m.data || '';
         const dataFmt = data ? new Date(data).toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }) : '';
-        const autor = m.author || m.autor || m.from || '';
+        const autor = m.sender || m.author || m.autor || m.from || '';
         const texto = (m.content || m.text || m.mensagem || '').substring(0, 80);
         resp += `${badge} ${dataFmt} — *${autor}*\n${texto}\n\n`;
       });
@@ -482,8 +482,8 @@ const commands = {
       if (msgs.length) {
         resp += `💬 *Últimas mensagens:*\n`;
         msgs.slice(0, 3).forEach(m => {
-          const texto = (m.content || m.text || m.mensagem || '').substring(0, 60);
-          const autor = m.author || m.autor || m.from || '';
+          const texto = (m.content || m.text || '').substring(0, 60);
+          const autor = m.sender || m.author || '';
           resp += `• ${autor}: ${texto}\n`;
         });
       }
@@ -925,7 +925,7 @@ app.get('/api/analise', async (req, res) => {
         const agora = new Date();
         const dias30 = new Date(agora.getTime() - 30 * 86400000);
         const msgsRecentes = msgs.filter(m => {
-          const d = m.date || m.data || m.createdAt;
+          const d = m.timestamp || m.date || m.data || m.createdAt;
           return d && new Date(d) >= dias30;
         });
 
@@ -936,7 +936,7 @@ app.get('/api/analise', async (req, res) => {
         // Atividade por dia (últimos 30d)
         const atividadePorDia = {};
         msgsRecentes.forEach(m => {
-          const d = (m.date || m.data || m.createdAt || '').substring(0, 10);
+          const d = (m.timestamp || m.date || m.data || m.createdAt || '').substring(0, 10);
           if (d) atividadePorDia[d] = (atividadePorDia[d] || 0) + 1;
         });
 
@@ -947,7 +947,7 @@ app.get('/api/analise', async (req, res) => {
         // Autores únicos
         const autores = new Set();
         msgsRecentes.forEach(m => {
-          const a = m.author || m.autor || m.from;
+          const a = m.sender || m.author || m.autor || m.from;
           if (a) autores.add(a);
         });
 
@@ -982,8 +982,8 @@ app.get('/api/analise', async (req, res) => {
           materiais: materiais.slice(0, 10),
           // Última mensagem
           ultimaMensagem: msgsRecentes[0] ? {
-            data: msgsRecentes[0].date || msgsRecentes[0].data,
-            autor: msgsRecentes[0].author || msgsRecentes[0].autor,
+            data: msgsRecentes[0].timestamp || msgsRecentes[0].date,
+            autor: msgsRecentes[0].sender || msgsRecentes[0].author,
             texto: (msgsRecentes[0].content || msgsRecentes[0].text || '').substring(0, 100),
             source: msgsRecentes[0].source,
           } : null,
