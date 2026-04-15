@@ -279,15 +279,18 @@ async function ai(prompt) {
 
 async function kiraSearchProject(nome) {
   try {
-    const r = await fetch(`${PLAN_URL}/projects?limit=500`);
+    const r = await fetch(`${KIRA_URL}/projects?limit=500`);
     const d = await r.json();
-    const projects = d.projects || d || [];
+    const projects = Array.isArray(d) ? d : (d.projects || []);
     const lower = nome.toLowerCase();
     return projects.filter(p => {
-      const pName = (p.name || p.title || p.cliente?.nome || '').toLowerCase();
+      const pName = (p.clienteNome || p.name || p.title || '').toLowerCase();
       return pName.includes(lower);
     });
-  } catch { return []; }
+  } catch (e) {
+    console.error('[KIRA] Erro buscando projetos:', e.message);
+    return [];
+  }
 }
 
 async function kiraGetMessages(projectId, source = 'all', limit = 20) {
@@ -403,7 +406,7 @@ const commands = {
       if (!projects.length) return sendMsg(chatId, `Nenhuma obra encontrada para "${args}".`);
       const proj = projects[0];
       const projectId = proj.id || proj._id;
-      const nome = proj.name || proj.title || proj.cliente?.nome || args;
+      const nome = proj.clienteNome || proj.name || proj.title || args;
       const msgs = await kiraGetMessages(projectId, 'all', 15);
       if (!msgs.length) return sendMsg(chatId, `📭 Nenhuma mensagem encontrada para *${nome}*.`);
 
@@ -434,7 +437,7 @@ const commands = {
       if (!projects.length) return sendMsg(chatId, `Nenhuma obra encontrada para "${args}".`);
       const proj = projects[0];
       const projectId = proj.id || proj._id;
-      const nome = proj.name || proj.title || proj.cliente?.nome || args;
+      const nome = proj.clienteNome || proj.name || proj.title || args;
 
       const [alertas, ocs, materiais, msgs] = await Promise.all([
         kiraGetAlerts(projectId),
