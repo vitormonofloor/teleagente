@@ -533,6 +533,127 @@ const commands = {
     return sendMsg(chatId, msg);
   },
 
+  '/indicadores': async (chatId) => {
+    try {
+      const r = await fetch(`${KIRA_URL}/projects?limit=500`);
+      const d = await r.json();
+      const projects = Array.isArray(d) ? d : (d.projects || []);
+      const hoje = new Date();
+      const total = projects.length;
+
+      // Status counts
+      const statusCount = {};
+      projects.forEach(p => { const s = p.status || '?'; statusCount[s] = (statusCount[s] || 0) + 1; });
+
+      // Metragem
+      const m2list = projects.map(p => parseFloat(p.projetoMetragem)).filter(m => !isNaN(m) && m > 0);
+      const m2total = m2list.reduce((a, b) => a + b, 0);
+      const m2avg = m2list.length ? m2total / m2list.length : 0;
+
+      // Atrasos
+      let atrasadas = 0;
+      projects.forEach(p => {
+        const dp = p.dataExecucaoPrevista;
+        if (dp) {
+          try {
+            if (new Date(dp) < hoje && !['finalizado', 'concluido', 'cancelado'].includes(p.status)) atrasadas++;
+          } catch {}
+        }
+      });
+
+      // Reparos
+      const reparos = projects.filter(p => (p.status || '').startsWith('reparo') || p.status === 'marcas_rolo_cera').length;
+
+      // Por consultor
+      const cons = {};
+      projects.forEach(p => {
+        const c = (p.consultorNome || '').trim();
+        if (!c || c === '[]') return;
+        if (!cons[c]) cons[c] = { total: 0, atraso: 0 };
+        cons[c].total++;
+        const dp = p.dataExecucaoPrevista;
+        if (dp) {
+          try {
+            if (new Date(dp) < hoje && !['finalizado', 'concluido', 'cancelado'].includes(p.status)) cons[c].atraso++;
+          } catch {}
+        }
+      });
+
+      // Por região
+      const regioes = {};
+      projects.forEach(p => {
+        let cidade = (p.projetoCidade || '?').toUpperCase();
+        if (cidade.includes('SÃO PAULO') || cidade.includes('SAO PAULO')) cidade = 'SP';
+        else if (cidade.includes('RIO')) cidade = 'RJ';
+        else if (cidade.includes('CURITIBA')) cidade = 'CWB';
+        else cidade = 'OUT';
+        if (!regioes[cidade]) regioes[cidade] = { total: 0, atraso: 0 };
+        regioes[cidade].total++;
+        const dp = p.dataExecucaoPrevista;
+        if (dp) {
+          try {
+            if (new Date(dp) < hoje && !['finalizado', 'concluido', 'cancelado'].includes(p.status)) regioes[cidade].atraso++;
+          } catch {}
+        }
+      });
+
+      // Gargalos (fases com mais obras ativas)
+      const fases = {};
+      projects.forEach(p => {
+        if (['finalizado', 'concluido', 'cancelado'].includes(p.status)) return;
+        const f = p.faseAtual || '?';
+        fases[f] = (fases[f] || 0) + 1;
+      });
+      const topFases = Object.entries(fases).sort((a, b) => b[1] - a[1]).slice(0, 5);
+
+      // Cores indefinidas
+      const corIndef = projects.filter(p => (p.projetoCores || []).includes('À DEFINIR')).length;
+
+      // Build message
+      const ativas = total - (statusCount.finalizado || 0) - (statusCount.concluido || 0) - (statusCount.cancelado || 0);
+      const taxaAtraso = ativas ? (atrasadas / ativas * 100).toFixed(0) : 0;
+      const taxaReparo = (statusCount.finalizado || 0) ? (reparos / ((statusCount.finalizado || 0) + reparos) * 100).toFixed(0) : 0;
+
+      let msg = `📊 *Indicadores Monofloor*\n`;
+      msg += `_${total} projetos | ${hoje.toLocaleDateString('pt-BR')}_\n\n`;
+
+      msg += `*Visão Geral:*\n`;
+      msg += `• ${ativas} obras ativas | ${m2total.toFixed(0)}m² total\n`;
+      msg += `• m² médio: ${m2avg.toFixed(0)}m²/obra\n`;
+      msg += `• Em execução: ${statusCount.em_execucao || 0}\n`;
+      msg += `• Planejamento: ${statusCount.planejamento || 0}\n`;
+      msg += `• Aguardando: ${statusCount.aguardando_execucao || 0}\n\n`;
+
+      const emojiAtraso = taxaAtraso > 20 ? '🔴' : taxaAtraso > 15 ? '🟡' : '🟢';
+      const emojiReparo = taxaReparo > 10 ? '🔴' : taxaReparo > 5 ? '🟡' : '🟢';
+      msg += `*Saúde:*\n`;
+      msg += `${emojiAtraso} Taxa de atraso: *${taxaAtraso}%* (${atrasadas} de ${ativas})\n`;
+      msg += `${emojiReparo} Taxa de reparo: *${taxaReparo}%* (${reparos})\n`;
+      msg += `⚠️ Cor indefinida: *${corIndef}* obras\n\n`;
+
+      msg += `*Por região:*\n`;
+      Object.entries(regioes).sort((a, b) => b[1].total - a[1].total).forEach(([r, d]) => {
+        const pct = d.total ? (d.atraso / d.total * 100).toFixed(0) : 0;
+        msg += `• ${r}: ${d.total} obras | ${d.atraso} atrasadas (${pct}%)\n`;
+      });
+
+      msg += `\n*Por consultor:*\n`;
+      Object.entries(cons).sort((a, b) => b[1].total - a[1].total).forEach(([c, d]) => {
+        const pct = d.total ? (d.atraso / d.total * 100).toFixed(0) : 0;
+        const nome = c.split(' ').slice(0, 2).join(' ');
+        msg += `• ${nome}: ${d.total} obras | ${d.atraso} atrasadas (${pct}%)\n`;
+      });
+
+      msg += `\n*Gargalos:*\n`;
+      topFases.forEach(([f, c]) => { msg += `• ${f}: ${c} obras\n`; });
+
+      return sendMsg(chatId, msg);
+    } catch (e) {
+      console.error('[KIRA] Erro /indicadores:', e.message);
+      return sendMsg(chatId, `Erro ao gerar indicadores: ${e.message}`);
+    }
+  },
+
   '/ajuda': async (chatId) => {
     return sendMsg(chatId, `🤖 *Teleagente Monofloor v2.2*\n\n` +
       `*Comandos:*\n` +
@@ -544,7 +665,8 @@ const commands = {
       `/status [nome] — Buscar obra\n\n` +
       `*KIRA (dados ao vivo):*\n` +
       `/mensagens [nome] — Mensagens TG/WA da obra\n` +
-      `/atividade [nome] — Alertas, ocorrências e materiais\n\n` +
+      `/atividade [nome] — Alertas, ocorrências e materiais\n` +
+      `/indicadores — Painel completo de indicadores\n\n` +
       `*Ocorrências e registro:*\n` +
       `/ocorrencias — Histórico do grupo\n` +
       `/resumo — Resumo da obra\n` +
