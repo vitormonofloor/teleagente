@@ -9,6 +9,7 @@ const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const PIPEFY_TOKEN = process.env.PIPEFY_TOKEN;
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
 const PLAN_URL = process.env.PLAN_API_URL || 'https://planejamento.monofloor.cloud/api';
+const KIRA_URL = process.env.KIRA_API_URL || 'https://cliente.monofloor.cloud/api';
 const TG_API = `https://api.telegram.org/bot${TG_TOKEN}`;
 
 const VITOR_CHAT_ID = process.env.VITOR_CHAT_ID; // Vitor's private chat for briefings
@@ -274,6 +275,57 @@ async function ai(prompt) {
   } catch (e) { return `Erro IA: ${e.message}`; }
 }
 
+// ── KIRA API HELPERS (cliente.monofloor.cloud) ────────────────────
+
+async function kiraSearchProject(nome) {
+  try {
+    const r = await fetch(`${PLAN_URL}/projects?limit=500`);
+    const d = await r.json();
+    const projects = d.projects || d || [];
+    const lower = nome.toLowerCase();
+    return projects.filter(p => {
+      const pName = (p.name || p.title || p.cliente?.nome || '').toLowerCase();
+      return pName.includes(lower);
+    });
+  } catch { return []; }
+}
+
+async function kiraGetMessages(projectId, source = 'all', limit = 20) {
+  try {
+    const r = await fetch(`${KIRA_URL}/projects/${projectId}/messages?source=${source}&limit=${limit}`);
+    if (!r.ok) return [];
+    const d = await r.json();
+    return d.messages || d || [];
+  } catch { return []; }
+}
+
+async function kiraGetAlerts(projectId) {
+  try {
+    const r = await fetch(`${KIRA_URL}/projects/${projectId}/alerts`);
+    if (!r.ok) return [];
+    const d = await r.json();
+    return d.alerts || d || [];
+  } catch { return []; }
+}
+
+async function kiraGetOcorrencias(projectId) {
+  try {
+    const r = await fetch(`${KIRA_URL}/projects/${projectId}/ocorrencias`);
+    if (!r.ok) return [];
+    const d = await r.json();
+    return d.ocorrencias || d || [];
+  } catch { return []; }
+}
+
+async function kiraGetMateriais(projectId) {
+  try {
+    const r = await fetch(`${KIRA_URL}/projects/${projectId}/materiais`);
+    if (!r.ok) return [];
+    const d = await r.json();
+    return d.materiais || d || [];
+  } catch { return []; }
+}
+
 // ── COMMAND HANDLERS ───────────────────────────────────────────────
 
 const commands = {
@@ -344,6 +396,106 @@ const commands = {
     } catch { return sendMsg(chatId, 'Erro ao consultar planejamento.'); }
   },
 
+  '/mensagens': async (chatId, args) => {
+    if (!args) return sendMsg(chatId, 'Use: /mensagens [nome do cliente]\nExemplo: /mensagens Christian Kort');
+    try {
+      const projects = await kiraSearchProject(args);
+      if (!projects.length) return sendMsg(chatId, `Nenhuma obra encontrada para "${args}".`);
+      const proj = projects[0];
+      const projectId = proj.id || proj._id;
+      const nome = proj.name || proj.title || proj.cliente?.nome || args;
+      const msgs = await kiraGetMessages(projectId, 'all', 15);
+      if (!msgs.length) return sendMsg(chatId, `📭 Nenhuma mensagem encontrada para *${nome}*.`);
+
+      let resp = `💬 *Mensagens — ${nome}*\n`;
+      resp += `📊 Últimas ${Math.min(msgs.length, 15)} mensagens:\n\n`;
+
+      msgs.slice(0, 15).forEach(m => {
+        const source = (m.source || m.tipo || '').toUpperCase().substring(0, 2);
+        const badge = source === 'TE' ? '🔵' : source === 'WH' ? '🟢' : '⚪';
+        const data = m.date || m.data || m.createdAt || '';
+        const dataFmt = data ? new Date(data).toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }) : '';
+        const autor = m.author || m.autor || m.from || '';
+        const texto = (m.content || m.text || m.mensagem || '').substring(0, 80);
+        resp += `${badge} ${dataFmt} — *${autor}*\n${texto}\n\n`;
+      });
+
+      return sendMsg(chatId, resp);
+    } catch (e) {
+      console.error('[KIRA] Erro /mensagens:', e.message);
+      return sendMsg(chatId, `Erro ao buscar mensagens: ${e.message}`);
+    }
+  },
+
+  '/atividade': async (chatId, args) => {
+    if (!args) return sendMsg(chatId, 'Use: /atividade [nome do cliente]\nExemplo: /atividade Sueli Higa');
+    try {
+      const projects = await kiraSearchProject(args);
+      if (!projects.length) return sendMsg(chatId, `Nenhuma obra encontrada para "${args}".`);
+      const proj = projects[0];
+      const projectId = proj.id || proj._id;
+      const nome = proj.name || proj.title || proj.cliente?.nome || args;
+
+      const [alertas, ocs, materiais, msgs] = await Promise.all([
+        kiraGetAlerts(projectId),
+        kiraGetOcorrencias(projectId),
+        kiraGetMateriais(projectId),
+        kiraGetMessages(projectId, 'all', 5),
+      ]);
+
+      let resp = `📊 *Atividade — ${nome}*\n\n`;
+
+      // Alertas
+      if (alertas.length) {
+        resp += `🚨 *${alertas.length} Alertas:*\n`;
+        alertas.slice(0, 5).forEach(a => {
+          const desc = a.message || a.descricao || a.title || JSON.stringify(a).substring(0, 60);
+          resp += `• ${desc}\n`;
+        });
+        resp += '\n';
+      }
+
+      // Ocorrências
+      if (ocs.length) {
+        resp += `📋 *${ocs.length} Ocorrências:*\n`;
+        ocs.slice(0, 5).forEach(o => {
+          const desc = o.descricao || o.description || o.title || JSON.stringify(o).substring(0, 60);
+          resp += `• ${desc}\n`;
+        });
+        resp += '\n';
+      }
+
+      // Materiais
+      if (materiais.length) {
+        resp += `📦 *${materiais.length} Materiais:*\n`;
+        materiais.slice(0, 3).forEach(m => {
+          const desc = m.nome || m.name || m.material || JSON.stringify(m).substring(0, 60);
+          resp += `• ${desc}\n`;
+        });
+        resp += '\n';
+      }
+
+      // Últimas mensagens
+      if (msgs.length) {
+        resp += `💬 *Últimas mensagens:*\n`;
+        msgs.slice(0, 3).forEach(m => {
+          const texto = (m.content || m.text || m.mensagem || '').substring(0, 60);
+          const autor = m.author || m.autor || m.from || '';
+          resp += `• ${autor}: ${texto}\n`;
+        });
+      }
+
+      if (!alertas.length && !ocs.length && !materiais.length && !msgs.length) {
+        resp += '📭 Nenhum dado encontrado na KIRA para este projeto.';
+      }
+
+      return sendMsg(chatId, resp);
+    } catch (e) {
+      console.error('[KIRA] Erro /atividade:', e.message);
+      return sendMsg(chatId, `Erro ao buscar atividade: ${e.message}`);
+    }
+  },
+
   '/ocorrencias': async (chatId) => {
     const ocs = ocorrencias[chatId];
     if (!ocs || !ocs.length) return sendMsg(chatId, '📋 Nenhuma ocorrência registrada neste grupo.');
@@ -379,29 +531,30 @@ const commands = {
   },
 
   '/ajuda': async (chatId) => {
-    return sendMsg(chatId, `🤖 *Teleagente Monofloor*\n\n` +
+    return sendMsg(chatId, `🤖 *Teleagente Monofloor v2.2*\n\n` +
       `*Comandos:*\n` +
       `/obras — Obras em execução\n` +
       `/gargalos — Gargalos ativos\n` +
       `/atrasadas — Obras atrasadas\n` +
       `/aproveitamento — Taxa no prazo\n` +
       `/alerta — Painel de alertas\n` +
-      `/status [nome] — Buscar obra\n` +
+      `/status [nome] — Buscar obra\n\n` +
+      `*KIRA (dados ao vivo):*\n` +
+      `/mensagens [nome] — Mensagens TG/WA da obra\n` +
+      `/atividade [nome] — Alertas, ocorrências e materiais\n\n` +
+      `*Ocorrências e registro:*\n` +
       `/ocorrencias — Histórico do grupo\n` +
-      `/resumo — Resumo da obra\n\n` +
-      `*Classificação manual:*\n` +
+      `/resumo — Resumo da obra\n` +
       `/diario [texto] — Registrar diário\n` +
       `/ocorrencia [tipo] — Registrar evento\n` +
       `/finalizar — Marcar como concluída\n` +
       `/pausa [motivo] — Pausar obra\n` +
       `/retomar — Retomar obra\n\n` +
-      `*Modo Ativo (proativo):*\n` +
-      `/briefing — Disparar briefing matinal agora\n` +
-      `/digest — Disparar digest diário agora\n` +
+      `*Modo Ativo:*\n` +
+      `/briefing — Disparar briefing agora\n` +
+      `/digest — Disparar digest agora\n` +
       `/grupos — Ver grupos rastreados\n\n` +
-      `*Tipos de ocorrência:*\n` +
-      `sem\\_aplicador, qualidade, comunicacao, cliente, clima, material\n\n` +
-      `🤖 Detecção automática ativa em grupos de obra.`
+      `🤖 Detecção automática ativa em grupos.`
     );
   },
 
@@ -561,7 +714,7 @@ app.post('/webhook', async (req, res) => {
     // ── PRIVATE MESSAGE: AI CHAT ──
     if (!isGroup && !text.startsWith('/')) {
       const resp = await ai(
-        `Você é o Teleagente da Monofloor, assistente operacional de piso de concreto polido. ` +
+        `Você é o Teleagente da Monofloor, assistente operacional. Monofloor é uma empresa de superfícies contínuas premium (compósito mineral + polímero). ` +
         `Vitor Gomes (Gerente de Qualidade) perguntou: "${text}". ` +
         `Responda direto em português, objetivo e com emojis quando apropriado.`
       );
@@ -578,8 +731,8 @@ app.get('/', (req, res) => {
   res.json({
     status: 'online',
     bot: '@monofloor_op_bot',
-    version: '2.1.0-ativo',
-    features: ['commands', 'keyword_detection', 'classification', 'ai_chat', 'proactive_briefing', 'dia_cego_detection', 'prazo_alerts', 'daily_digest'],
+    version: '2.2.0-kira',
+    features: ['commands', 'keyword_detection', 'classification', 'ai_chat', 'proactive_briefing', 'dia_cego_detection', 'prazo_alerts', 'daily_digest', 'kira_messages', 'kira_activity'],
     ocorrencias: Object.keys(ocorrencias).length + ' groups tracked',
     sinais: Object.keys(obraStatus).length + ' status overrides',
   });
@@ -833,7 +986,7 @@ app.get('/api/groups', (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Teleagente v2.1 ATIVO — port ${PORT}`);
+  console.log(`Teleagente v2.2 ATIVO + KIRA — port ${PORT}`);
   console.log(`Keywords: ${Object.values(KEYWORDS).reduce((s, k) => s + k.palavras.length, 0)} mapped`);
   console.log(`Types: ${Object.keys(KEYWORDS).length}`);
   console.log(`VITOR_CHAT_ID: ${VITOR_CHAT_ID ? 'configurado' : '⚠️ NÃO CONFIGURADO'}`);
@@ -845,13 +998,16 @@ app.listen(PORT, () => {
   if (VITOR_CHAT_ID) {
     setTimeout(() => {
       sendMsg(VITOR_CHAT_ID,
-        `🤖 *Teleagente v2.1 ATIVO*\n\n` +
+        `🤖 *Teleagente v2.2 ATIVO — KIRA integrada*\n\n` +
         `Bot reiniciado e online.\n` +
         `Modo ativo habilitado:\n` +
         `• 🌅 Briefing matinal às 8h\n` +
         `• ⏰ Alerta de prazo às 12h\n` +
         `• 📊 Digest diário às 18h\n` +
         `• 👁️ Dia cego check às 20h\n\n` +
+        `🆕 *Novos comandos KIRA:*\n` +
+        `• /mensagens [nome] — msgs TG/WA\n` +
+        `• /atividade [nome] — alertas + ocorrências\n\n` +
         `Grupos rastreados: ${Object.keys(trackedGroups).length}`
       );
     }, 30000);
